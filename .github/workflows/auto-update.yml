@@ -1,0 +1,149 @@
+name: Auto-Update Upstream DeepSeek Harness
+
+on:
+  schedule:
+    # Check npm for new @deepseek-ai/dsh releases every 6 hours.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "npm dist-tag to track (latest or next)"
+        required: true
+        default: "latest"
+        type: choice
+        options:
+          - latest
+          - next
+      force:
+        description: "Force rebuild even if version matches Dockerfile"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: auto-update-deepseek-harness
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_update: ${{ steps.check.outputs.needs_update }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
+      current_version: ${{ steps.check.outputs.current_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Compare npm dist-tag against docker/Dockerfile
+        id: check
+        run: |
+          DIST_TAG="${{ inputs.dist_tag || 'latest' }}"
+          UPSTREAM_VERSION=$(npm view @deepseek-ai/dsh "dist-tags.${DIST_TAG}" | tr -d '[:space:]')
+          CURRENT_VERSION=$(grep -E '^ARG DSH_VERSION=' docker/Dockerfile | head -n1 | cut -d= -f2 | tr -d '[:space:]')
+          echo "Upstream @deepseek-ai/dsh@${DIST_TAG}: ${UPSTREAM_VERSION}"
+          echo "Current docker/Dockerfile DSH_VERSION: ${CURRENT_VERSION}"
+          if [ -z "${UPSTREAM_VERSION}" ]; then
+            echo "Could not resolve upstream version" >&2
+            exit 1
+          fi
+          echo "upstream_version=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "current_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+          if [ "${UPSTREAM_VERSION}" != "${CURRENT_VERSION}" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-entrypoint:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Run entrypoint unit tests
+        run: node --test docker/entrypoint.test.mjs
+
+  build-and-update-store:
+    needs: [check-upstream, test-entrypoint]
+    if: needs.check-upstream.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.upstream_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ needs.check-upstream.outputs.upstream_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            DSH_VERSION=${{ needs.check-upstream.outputs.upstream_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify multi-arch manifest list
+        run: |
+          IMAGE_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker buildx imagetools inspect "${IMAGE_LOWER}:${{ needs.check-upstream.outputs.upstream_version }}@${{ steps.build.outputs.digest }}"
+
+      - name: Update Dockerfile and Umbrel Community App Store manifests
+        run: |
+          IMAGE_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          VER="${{ needs.check-upstream.outputs.upstream_version }}"
+          node scripts/update-manifest.mjs \
+            --dsh-version "${VER}" \
+            --image-tag "${VER}" \
+            --image-repo "${IMAGE_LOWER}" \
+            --digest "${{ steps.build.outputs.digest }}" \
+            --release-notes "- Automated upstream update to DeepSeek Harness (@deepseek-ai/dsh) ${VER}."
+
+      - name: Commit, tag, and push update
+        run: |
+          VER="${{ needs.check-upstream.outputs.upstream_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docker/Dockerfile deepseek-harness/docker-compose.yml deepseek-harness/umbrel-app.yml
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update @deepseek-ai/dsh to ${VER}"
+          git push origin HEAD:main
+          if ! git rev-parse "v${VER}" >/dev/null 2>&1; then
+            git tag "v${VER}"
+            git push origin "v${VER}"
+          fi
