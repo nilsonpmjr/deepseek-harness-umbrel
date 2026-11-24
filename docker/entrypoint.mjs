@@ -14,7 +14,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { pathToFileURL } from 'node:url'
@@ -171,6 +171,23 @@ function buildUpstreamHeaders(incomingHeaders, backendAuthority) {
 }
 
 /**
+ * Determine whether a request requires same-origin CSRF validation.
+ * Top-level GET/HEAD document navigations (e.g. clicking the app icon from the
+ * Umbrel dashboard across http/https or returning from /app-auth) are allowed,
+ * matching dsh web's own /api trust fence.
+ */
+function requiresSameOriginCheck(req) {
+  const method = (req.method ?? 'GET').toUpperCase()
+  if (method !== 'GET' && method !== 'HEAD') return true
+  try {
+    const { pathname } = new URL(req.url ?? '/', 'http://proxy.invalid')
+    return pathname === '/api' || pathname.startsWith('/api/')
+  } catch {
+    return true
+  }
+}
+
+/**
  * Create the HTTP + WebSocket reverse proxy server.
  */
 export function createProxyServer({
@@ -246,7 +263,7 @@ export function createProxyServer({
       return
     }
 
-    if (!isTrustedSameOriginRequest(req.headers)) {
+    if (requiresSameOriginCheck(req) && !isTrustedSameOriginRequest(req.headers)) {
       res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
       res.end('Forbidden\n')
       return
@@ -336,6 +353,7 @@ function startSupervisor() {
   const dshHome = process.env.DSH_HOME || '/data/dsh-home'
   const workspaceDir = process.env.DSH_WORKSPACE || '/data/workspace'
   const userHome = process.env.HOME || '/data/home'
+  const patchFile = process.env.DSH_WEB_PATCH_FILE || ''
 
   for (const dir of [dshHome, workspaceDir, userHome]) {
     mkdirSync(dir, { recursive: true })
@@ -350,7 +368,11 @@ function startSupervisor() {
     if (shuttingDown) return
     launchToken = null
 
-    const args = ['web', '--host', backendHost, '--port', String(backendPort), '--no-open']
+    const args = ['--profile', 'web']
+    if (patchFile && existsSync(patchFile) && process.env.DSH_ENABLE_ACCOUNT_SIGNIN !== '1') {
+      args.push('--patch', patchFile)
+    }
+    args.push('--host', backendHost, '--port', String(backendPort), '--no-open')
     console.log(`[dsh-umbrel] starting backend: ${dshBin} ${args.join(' ')}`)
 
     const proc = spawn(dshBin, args, {

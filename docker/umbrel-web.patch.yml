@@ -1,0 +1,13 @@
+# Remote Umbrel deployments cannot complete DeepSeek Account OAuth sign-in
+# because DeepSeek's OAuth callback only accepts loopback HTTP origins
+# (http://localhost or http://127.0.0.1). Disabling the account plugins lets
+# first-run onboarding open the API Key setup dialog directly and falls back
+# to the standard Settings button in the sidebar.
+- id: deepseek-account
+  disabled: true
+- id: llm-deepseek-account
+  disabled: true
+- id: ui-settings-account
+  disabled: true
+- id: ui-account-notifications
+  disabled: true

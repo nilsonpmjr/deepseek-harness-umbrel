@@ -176,11 +176,21 @@ describe('createProxyServer', () => {
       assert.match(authedOpen.body, /DeepSeek Harness Ready/)
       assert.equal(capturedHeaders.origin, `http://127.0.0.1:${backendPort}`)
 
-      // 6. Cross-origin request is rejected with 403
-      const csrf = await request(proxyPort, '/api/test', {
+      // 6. Cross-origin /api request is rejected with 403, while top-level GET / navigation succeeds
+      const csrfApi = await request(proxyPort, '/api/test', {
         headers: { host: 'umbrel.local:3080', origin: 'https://attacker.invalid' },
       })
-      assert.equal(csrf.statusCode, 403)
+      assert.equal(csrfApi.statusCode, 403)
+
+      const csrfCrossSiteApi = await request(proxyPort, '/api/test', {
+        headers: { host: 'umbrel.local:3080', 'sec-fetch-site': 'cross-site' },
+      })
+      assert.equal(csrfCrossSiteApi.statusCode, 403)
+
+      const topLevelNav = await request(proxyPort, '/', {
+        headers: { host: 'umbrel.local:3080', 'sec-fetch-site': 'cross-site' },
+      })
+      assert.equal(topLevelNav.statusCode, 303)
 
       // 7. WebSocket upgrade tunnels cleanly and rewrites Host/Origin
       const wsResult = await new Promise((resolve, reject) => {
