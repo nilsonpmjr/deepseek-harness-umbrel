@@ -46,7 +46,7 @@ COPY --from=builder /opt/dsh /opt/dsh
 RUN ln -sf /opt/dsh/node_modules/.bin/dsh /usr/local/bin/dsh
 
 COPY docker/entrypoint.mjs /app/entrypoint.mjs
-COPY docker/umbrel-web.patch.yml /app/umbrel-web.patch.yml
+COPY docker/oauth-helper.js /app/oauth-helper.js
 
 RUN mkdir -p /data/dsh-home /data/workspace /data/home /data/shared \
   && chown -R 1000:1000 /data /app
@@ -59,7 +59,6 @@ ENV DSH_HOME=/data/dsh-home \
     DSH_PROXY_PORT=3080 \
     DSH_BACKEND_PORT=3081 \
     DSH_UMBREL_APP_PROXY_AUTH=1 \
-    DSH_WEB_PATCH_FILE=/app/umbrel-web.patch.yml \
     NODE_ENV=production
 
 USER 1000:1000

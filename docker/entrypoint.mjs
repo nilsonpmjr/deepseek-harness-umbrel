@@ -10,17 +10,30 @@
  *  - When `DSH_UMBREL_APP_PROXY_AUTH=1` (protected by Umbrel app_proxy auth), transparently
  *    exchange the launch token on unauthenticated `GET /` requests so any browser works
  *    immediately without manual token copying.
+ *  - Enable DeepSeek Account OAuth sign-in from non-loopback Umbrel browsers (umbrel.local,
+ *    LAN IP, Tailscale, HTTPS) by rewriting non-loopback `callbackOrigin` in
+ *    `POST /api/account/startSignIn` to the container's loopback origin and providing a
+ *    same-origin callback relay (`POST /__umbrel/oauth-complete`) paired with an injected
+ *    browser helper (`/ __umbrel/oauth-helper.js`).
  *  - Serve a clean auto-refreshing loading page while `dsh web` is booting.
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
-import { pathToFileURL } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const TOKEN_PATTERN = /\?token=([A-Za-z0-9_-]+)/u
 const AUTH_COOKIE_PATTERN = /(?:^|;\s*)dsh-auth-[^=;\s]+=/u
+const LOOPBACK_ORIGIN_PATTERN = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):([1-9][0-9]*)\/?$/i
+const MAX_CONTROL_BODY_BYTES = 65_536
+const PENDING_SIGNIN_TTL_MS = 10 * 60 * 1000
+const HELPER_SCRIPT_TAG = '<script src="/__umbrel/oauth-helper.js" defer></script>'
+
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
+const OAUTH_HELPER_JS = readFileSync(join(MODULE_DIR, 'oauth-helper.js'), 'utf8')
 
 const LOADING_HTML = `<!doctype html>
 <html lang="en">
@@ -126,6 +139,105 @@ export function isTrustedSameOriginRequest(headers) {
 }
 
 /**
+ * Check whether an origin already satisfies DeepSeek's loopback HTTP OAuth redirect_uri requirement.
+ */
+export function isLoopbackOrigin(value) {
+  return typeof value === 'string' && LOOPBACK_ORIGIN_PATTERN.test(value.trim())
+}
+
+/**
+ * Rewrite non-loopback `callbackOrigin` in `POST /api/account/startSignIn` RPC payloads
+ * so DeepSeek's platform OAuth server (`auth_init`) accepts the request from remote Umbrel hosts.
+ */
+export function rewriteStartSignInBody(rawBody, loopbackOrigin) {
+  try {
+    const parsed = JSON.parse(rawBody.toString('utf8'))
+    const args = parsed?.payload?.args
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      if (typeof args.callbackOrigin === 'string' && !isLoopbackOrigin(args.callbackOrigin)) {
+        args.callbackOrigin = loopbackOrigin
+        return { body: Buffer.from(JSON.stringify(parsed), 'utf8'), rewritten: true }
+      }
+    } else if (Array.isArray(args) && typeof args[1] === 'string' && !isLoopbackOrigin(args[1])) {
+      args[1] = loopbackOrigin
+      return { body: Buffer.from(JSON.stringify(parsed), 'utf8'), rewritten: true }
+    }
+  } catch {
+    // Forward malformed JSON untouched so dsh web produces its standard RPC error.
+  }
+  return { body: rawBody, rewritten: false }
+}
+
+/**
+ * Parse a user-pasted OAuth callback URL (full URL, path+query, or raw query) and return a
+ * canonical `/oauth/callback?code=...&state=...` path safe to forward to loopback `dsh web`.
+ */
+export function parseOAuthCallbackInput(rawInput) {
+  if (typeof rawInput !== 'string') {
+    return { ok: false, error: 'missing_params' }
+  }
+  const trimmed = rawInput.trim()
+  if (!trimmed || /[\r\n]/u.test(trimmed)) {
+    return { ok: false, error: 'missing_params' }
+  }
+
+  let parsed
+  try {
+    if (/^https?:\/\//i.test(trimmed)) {
+      parsed = new URL(trimmed)
+      if (parsed.pathname !== '/oauth/callback') {
+        return { ok: false, error: 'missing_params' }
+      }
+    } else if (trimmed.startsWith('/')) {
+      parsed = new URL(trimmed, 'http://127.0.0.1')
+      if (parsed.pathname !== '/oauth/callback') {
+        return { ok: false, error: 'missing_params' }
+      }
+    } else if (trimmed.startsWith('?')) {
+      parsed = new URL(`/oauth/callback${trimmed}`, 'http://127.0.0.1')
+    } else {
+      parsed = new URL(`/oauth/callback?${trimmed}`, 'http://127.0.0.1')
+    }
+  } catch {
+    return { ok: false, error: 'missing_params' }
+  }
+
+  const codes = parsed.searchParams.getAll('code')
+  const states = parsed.searchParams.getAll('state')
+  const code = codes.length === 1 ? codes[0].trim() : ''
+  const state = states.length === 1 ? states[0].trim() : ''
+  if (!code || !state) {
+    return { ok: false, error: 'missing_params' }
+  }
+
+  return {
+    ok: true,
+    code,
+    state,
+    path: `/oauth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+  }
+}
+
+/**
+ * Splice the Umbrel remote OAuth helper script into the served SPA index.html.
+ */
+export function injectOAuthHelperScript(html) {
+  if (html.includes('/__umbrel/oauth-helper.js')) return html
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, `${HELPER_SCRIPT_TAG}</body>`)
+  }
+  return `${html}${HELPER_SCRIPT_TAG}`
+}
+
+function getPathname(rawUrl) {
+  try {
+    return new URL(rawUrl ?? '/', 'http://proxy.invalid').pathname
+  } catch {
+    return ''
+  }
+}
+
+/**
  * Check whether an incoming request targets the clean root document without a query token.
  */
 function isCleanRootGet(req) {
@@ -136,6 +248,12 @@ function isCleanRootGet(req) {
   } catch {
     return false
   }
+}
+
+function isIndexDocumentGet(req) {
+  if (req.method !== 'GET') return false
+  const pathname = getPathname(req.url)
+  return pathname === '/' || pathname === '/index.html'
 }
 
 function hasAuthCookie(headers) {
@@ -179,12 +297,44 @@ function buildUpstreamHeaders(incomingHeaders, backendAuthority) {
 function requiresSameOriginCheck(req) {
   const method = (req.method ?? 'GET').toUpperCase()
   if (method !== 'GET' && method !== 'HEAD') return true
-  try {
-    const { pathname } = new URL(req.url ?? '/', 'http://proxy.invalid')
-    return pathname === '/api' || pathname.startsWith('/api/')
-  } catch {
-    return true
-  }
+  const pathname = getPathname(req.url)
+  if (!pathname) return true
+  return (
+    pathname === '/api'
+    || pathname.startsWith('/api/')
+    || pathname === '/__umbrel'
+    || pathname.startsWith('/__umbrel/')
+  )
+}
+
+function readRequestBody(req, maxBytes = MAX_CONTROL_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let total = 0
+    req.on('data', (chunk) => {
+      total += chunk.length
+      if (total > maxBytes) {
+        const err = new Error('Payload too large')
+        err.code = 'PAYLOAD_TOO_LARGE'
+        reject(err)
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': String(Buffer.byteLength(body)),
+  })
+  res.end(body)
 }
 
 /**
@@ -197,9 +347,28 @@ export function createProxyServer({
   getLaunchToken,
 }) {
   const backendAuthority = `${backendHost}:${backendPort}`
+  const backendOrigin = `http://${backendAuthority}`
 
-  function forwardHttp(clientReq, clientRes, targetPath, retryWithToken) {
+  let pendingRemoteSignInUntil = 0
+  const isRemoteSignInPending = () => Date.now() < pendingRemoteSignInUntil
+  const markRemoteSignInPending = () => {
+    pendingRemoteSignInUntil = Date.now() + PENDING_SIGNIN_TTL_MS
+  }
+  const clearRemoteSignInPending = () => {
+    pendingRemoteSignInUntil = 0
+  }
+
+  function forwardHttp(clientReq, clientRes, targetPath, { retryWithToken = false, injectHelper = false, bodyBuffer = null, onUpstreamResponse = null } = {}) {
     const upstreamHeaders = buildUpstreamHeaders(clientReq.headers, backendAuthority)
+    if (injectHelper) {
+      // Request uncompressed index.html so the helper script can be spliced cleanly.
+      upstreamHeaders['accept-encoding'] = 'identity'
+    }
+    if (bodyBuffer !== null) {
+      upstreamHeaders['content-length'] = String(bodyBuffer.length)
+      delete upstreamHeaders['transfer-encoding']
+    }
+
     const upstreamReq = http.request(
       {
         hostname: backendHost,
@@ -213,7 +382,29 @@ export function createProxyServer({
         if (retryWithToken && upstreamRes.statusCode === 401 && token) {
           upstreamRes.resume()
           const authedPath = `/?token=${encodeURIComponent(token)}`
-          forwardHttp(clientReq, clientRes, authedPath, false)
+          forwardHttp(clientReq, clientRes, authedPath, { retryWithToken: false, injectHelper: false })
+          return
+        }
+
+        if (onUpstreamResponse) {
+          onUpstreamResponse(upstreamRes.statusCode ?? 502)
+        }
+
+        const contentType = String(upstreamRes.headers['content-type'] ?? '').toLowerCase()
+        const contentEncoding = String(upstreamRes.headers['content-encoding'] ?? '').toLowerCase()
+        if (injectHelper && upstreamRes.statusCode === 200 && contentType.includes('text/html') && !contentEncoding) {
+          const chunks = []
+          upstreamRes.on('data', (chunk) => chunks.push(chunk))
+          upstreamRes.on('end', () => {
+            const rawHtml = Buffer.concat(chunks).toString('utf8')
+            const injected = injectOAuthHelperScript(rawHtml)
+            const outBytes = Buffer.from(injected, 'utf8')
+            const outHeaders = { ...upstreamRes.headers }
+            outHeaders['content-length'] = String(outBytes.length)
+            delete outHeaders['transfer-encoding']
+            clientRes.writeHead(200, outHeaders)
+            clientRes.end(outBytes)
+          })
           return
         }
 
@@ -238,11 +429,80 @@ export function createProxyServer({
       upstreamReq.destroy()
     })
 
-    if (clientReq.method === 'GET' || clientReq.method === 'HEAD') {
+    if (bodyBuffer !== null) {
+      upstreamReq.end(bodyBuffer)
+    } else if (clientReq.method === 'GET' || clientReq.method === 'HEAD') {
       upstreamReq.end()
     } else {
       clientReq.pipe(upstreamReq)
     }
+  }
+
+  function handleOAuthComplete(req, res) {
+    readRequestBody(req)
+      .then((raw) => {
+        let parsedBody
+        try {
+          parsedBody = JSON.parse(raw.toString('utf8'))
+        } catch {
+          sendJson(res, 400, { ok: false, error: 'missing_params' })
+          return
+        }
+
+        const callback = parseOAuthCallbackInput(parsedBody?.callbackUrl)
+        if (!callback.ok) {
+          sendJson(res, 400, { ok: false, error: callback.error })
+          return
+        }
+
+        const upstreamHeaders = {
+          host: backendAuthority,
+          accept: 'text/html, */*;q=0.8',
+        }
+        if (typeof req.headers.cookie === 'string' && req.headers.cookie !== '') {
+          upstreamHeaders.cookie = req.headers.cookie
+        }
+
+        const upstreamReq = http.request(
+          {
+            hostname: backendHost,
+            port: backendPort,
+            method: 'GET',
+            path: callback.path,
+            headers: upstreamHeaders,
+            agent: false,
+          },
+          (upstreamRes) => {
+            // Drain response body completely before answering so dsh web finishes commit cleanly.
+            upstreamRes.resume()
+            upstreamRes.on('end', () => {
+              const status = upstreamRes.statusCode ?? 502
+              if (status === 302) {
+                clearRemoteSignInPending()
+                sendJson(res, 200, { ok: true })
+              } else if (status === 400) {
+                sendJson(res, 400, { ok: false, error: 'invalid_callback' })
+              } else if (status === 410) {
+                clearRemoteSignInPending()
+                sendJson(res, 410, { ok: false, error: 'expired' })
+              } else if (status === 200 || status === 204) {
+                clearRemoteSignInPending()
+                sendJson(res, 502, { ok: false, error: 'exchange_failed' })
+              } else {
+                sendJson(res, 502, { ok: false, error: 'upstream_error', status })
+              }
+            })
+          },
+        )
+        upstreamReq.on('error', () => {
+          sendJson(res, 502, { ok: false, error: 'upstream_error' })
+        })
+        upstreamReq.end()
+      })
+      .catch((error) => {
+        const status = error?.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400
+        sendJson(res, status, { ok: false, error: 'invalid_request' })
+      })
   }
 
   const server = http.createServer((req, res) => {
@@ -251,14 +511,13 @@ export function createProxyServer({
     res.setTimeout(0)
 
     const token = getLaunchToken()
+    const pathname = getPathname(req.url)
 
-    if (req.url === '/__health') {
+    if (pathname === '/__health') {
       if (token) {
-        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-        res.end('{"status":"ready"}\n')
+        sendJson(res, 200, { status: 'ready' })
       } else {
-        res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-        res.end('{"status":"starting"}\n')
+        sendJson(res, 503, { status: 'starting' })
       }
       return
     }
@@ -266,6 +525,24 @@ export function createProxyServer({
     if (requiresSameOriginCheck(req) && !isTrustedSameOriginRequest(req.headers)) {
       res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
       res.end('Forbidden\n')
+      return
+    }
+
+    if (req.method === 'GET' && pathname === '/__umbrel/oauth-helper.js') {
+      res.writeHead(200, {
+        'content-type': 'text/javascript; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': String(Buffer.byteLength(OAUTH_HELPER_JS)),
+      })
+      res.end(OAUTH_HELPER_JS)
+      return
+    }
+
+    if (req.method === 'GET' && pathname === '/__umbrel/oauth-status') {
+      sendJson(res, 200, {
+        pending: isRemoteSignInPending(),
+        callbackOrigin: backendOrigin,
+      })
       return
     }
 
@@ -287,13 +564,46 @@ export function createProxyServer({
       return
     }
 
-    const rootGet = isCleanRootGet(req)
-    if (autoAuth && rootGet && !hasAuthCookie(req.headers)) {
-      forwardHttp(req, res, `/?token=${encodeURIComponent(token)}`, false)
+    if (req.method === 'POST' && pathname === '/__umbrel/oauth-complete') {
+      handleOAuthComplete(req, res)
       return
     }
 
-    forwardHttp(req, res, req.url ?? '/', autoAuth && rootGet)
+    if (req.method === 'POST' && pathname === '/api/account/startSignIn') {
+      readRequestBody(req)
+        .then((rawBody) => {
+          const { body, rewritten } = rewriteStartSignInBody(rawBody, backendOrigin)
+          forwardHttp(req, res, req.url ?? '/api/account/startSignIn', {
+            bodyBuffer: body,
+            onUpstreamResponse: (status) => {
+              if (rewritten && status === 200) {
+                markRemoteSignInPending()
+              }
+            },
+          })
+        })
+        .catch((error) => {
+          const status = error?.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400
+          res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+          res.end('Invalid request\n')
+        })
+      return
+    }
+
+    if (req.method === 'POST' && (pathname === '/api/account/cancelSignIn' || pathname === '/api/account/signOut')) {
+      clearRemoteSignInPending()
+      forwardHttp(req, res, req.url ?? pathname)
+      return
+    }
+
+    const rootGet = isCleanRootGet(req)
+    const indexGet = isIndexDocumentGet(req)
+    if (autoAuth && rootGet && !hasAuthCookie(req.headers)) {
+      forwardHttp(req, res, `/?token=${encodeURIComponent(token)}`, { retryWithToken: false, injectHelper: false })
+      return
+    }
+
+    forwardHttp(req, res, req.url ?? '/', { retryWithToken: autoAuth && rootGet, injectHelper: indexGet })
   })
 
   server.on('upgrade', (req, clientSocket, head) => {
@@ -353,7 +663,6 @@ function startSupervisor() {
   const dshHome = process.env.DSH_HOME || '/data/dsh-home'
   const workspaceDir = process.env.DSH_WORKSPACE || '/data/workspace'
   const userHome = process.env.HOME || '/data/home'
-  const patchFile = process.env.DSH_WEB_PATCH_FILE || ''
 
   for (const dir of [dshHome, workspaceDir, userHome]) {
     mkdirSync(dir, { recursive: true })
@@ -368,11 +677,7 @@ function startSupervisor() {
     if (shuttingDown) return
     launchToken = null
 
-    const args = ['--profile', 'web']
-    if (patchFile && existsSync(patchFile) && process.env.DSH_ENABLE_ACCOUNT_SIGNIN !== '1') {
-      args.push('--patch', patchFile)
-    }
-    args.push('--host', backendHost, '--port', String(backendPort), '--no-open')
+    const args = ['--profile', 'web', '--host', backendHost, '--port', String(backendPort), '--no-open']
     console.log(`[dsh-umbrel] starting backend: ${dshBin} ${args.join(' ')}`)
 
     const proc = spawn(dshBin, args, {
